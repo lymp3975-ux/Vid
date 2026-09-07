@@ -3,6 +3,7 @@ import asyncio
 import tempfile
 import shutil
 import logging
+import subprocess
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeVideo
 import yt_dlp
@@ -37,12 +38,48 @@ logger.info(f"API_ID loaded: {API_ID}")
 logger.info(f"API_HASH loaded: {'YES' if API_HASH else 'NO'}")
 logger.info(f"BOT_TOKEN loaded: {'YES' if BOT_TOKEN else 'NO'}")
 
+# ─── Browser Headers ───
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
 # ─── Init Client ───
 client = TelegramClient("session", API_ID, API_HASH)
 
+# ─── yt-dlp Base Options ───
+def get_ydl_opts(outtmpl: str):
+    opts = {
+        "outtmpl": outtmpl,
+        "format": "best[filesize<2G]/best/bestvideo+bestaudio",
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True,
+        "http_headers": BROWSER_HEADERS,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"],
+                "player_skip": ["webpage", "configs", "js"],
+            }
+        },
+    }
+    # Use cookies.txt if it exists (for YouTube)
+    if os.path.exists("/app/cookies.txt"):
+        opts["cookiefile"] = "/app/cookies.txt"
+        logger.info("Using cookies.txt for yt-dlp")
+    return opts
+
 # ─── Download Helpers ───
 async def download_direct(url: str, path: str, status_msg):
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=None)) as resp:
             if resp.status != 200:
                 raise Exception(f"HTTP {resp.status}")
@@ -70,13 +107,7 @@ async def download_ytdlp(url: str, outtmpl: str):
     loop = asyncio.get_event_loop()
     
     def _download():
-        ydl_opts = {
-            "outtmpl": outtmpl,
-            "format": "best[filesize<2G]/best/bestvideo+bestaudio",
-            "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
-        }
+        ydl_opts = get_ydl_opts(outtmpl)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             if info.get("requested_downloads"):
@@ -84,6 +115,38 @@ async def download_ytdlp(url: str, outtmpl: str):
             return ydl.prepare_filename(info)
     
     return await loop.run_in_executor(None, _download)
+
+async def download_ffmpeg_m3u8(url: str, path: str, status_msg):
+    """Fallback for m3u8 that yt-dlp can't handle (403 errors)."""
+    headers = "\r\n".join([f"{k}: {v}" for k, v in BROWSER_HEADERS.items()])
+    
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-headers", headers,
+        "-i", url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        path
+    ]
+    
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    await status_msg.edit("Downloading via ffmpeg... (this may take a while)")
+    stdout, stderr = await proc.communicate()
+    
+    if proc.returncode != 0:
+        err = stderr.decode()[-500:] if stderr else "Unknown ffmpeg error"
+        raise Exception(f"ffmpeg failed: {err}")
+    
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise Exception("ffmpeg produced no output")
+    
+    return path
 
 # ─── Handlers ───
 @client.on(events.NewMessage(pattern="/start"))
@@ -93,7 +156,7 @@ async def start(event):
         "Send me any video link and I'll download & upload it here.\n\n"
         "Direct MP4 / Signed URLs\n"
         "m3u8 / HLS / Bunny.net\n"
-        "YouTube, Facebook, TikTok, etc.\n\n"
+        "YouTube (may need cookies.txt)\n\n"
         f"Max file size: {MAX_SIZE_GB} GB",
         parse_mode="markdown"
     )
@@ -114,11 +177,20 @@ async def handle_message(event):
         
         await status.edit("Downloading... Please wait.")
         
-        if is_m3u8 or not is_direct_mp4:
-            filepath = await download_ytdlp(url, base_path + ".%(ext)s")
-        else:
+        if is_direct_mp4:
             filepath = base_path + ".mp4"
             await download_direct(url, filepath, status)
+        elif is_m3u8:
+            # Try yt-dlp first, fallback to ffmpeg with browser headers
+            try:
+                filepath = await download_ytdlp(url, base_path + ".%(ext)s")
+            except Exception as e:
+                logger.warning(f"yt-dlp failed for m3u8: {e}, trying ffmpeg...")
+                filepath = base_path + ".mp4"
+                await download_ffmpeg_m3u8(url, filepath, status)
+        else:
+            # YouTube and others
+            filepath = await download_ytdlp(url, base_path + ".%(ext)s")
         
         if not os.path.exists(filepath):
             raise Exception("Download failed — file not found.")
@@ -152,8 +224,32 @@ async def handle_message(event):
         await status.delete()
         
     except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        await status.edit(f"Error: {str(e)}", parse_mode="markdown")
+        err_str = str(e)
+        logger.error(f"Error: {err_str}", exc_info=True)
+        
+        if "Sign in to confirm" in err_str:
+            await status.edit(
+                "Error: YouTube is blocking downloads.\n\n"
+                "To fix this, you need to add a cookies.txt file:\n"
+                "1. Install 'Get cookies.txt LOCALLY' extension in Chrome\n"
+                "2. Go to youtube.com and sign in\n"
+                "3. Export cookies as cookies.txt\n"
+                "4. Add it to your GitHub repo root\n"
+                "5. Redeploy",
+                parse_mode="markdown"
+            )
+        elif "HTTP Error 403" in err_str:
+            await status.edit(
+                "Error: The video host is blocking the download (403 Forbidden).\n\n"
+                "This usually means:\n"
+                "- The link expired\n"
+                "- The link needs a Referer header from the original website\n"
+                "- The host requires login/cookies\n\n"
+                "Try getting a fresh link from the source website.",
+                parse_mode="markdown"
+            )
+        else:
+            await status.edit(f"Error: {err_str[:400]}", parse_mode="markdown")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
