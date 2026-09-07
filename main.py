@@ -3,7 +3,7 @@ import asyncio
 import tempfile
 import shutil
 import logging
-import subprocess
+import re
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeVideo
 import yt_dlp
@@ -41,15 +41,15 @@ logger.info(f"BOT_TOKEN loaded: {'YES' if BOT_TOKEN else 'NO'}")
 # ─── Browser Headers ───
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
+    "Origin": "https://bunny.net",
+    "Referer": "https://bunny.net/",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
 }
 
 # ─── Init Client ───
@@ -71,7 +71,6 @@ def get_ydl_opts(outtmpl: str):
             }
         },
     }
-    # Use cookies.txt if it exists (for YouTube)
     if os.path.exists("/app/cookies.txt"):
         opts["cookiefile"] = "/app/cookies.txt"
         logger.info("Using cookies.txt for yt-dlp")
@@ -117,13 +116,13 @@ async def download_ytdlp(url: str, outtmpl: str):
     return await loop.run_in_executor(None, _download)
 
 async def download_ffmpeg_m3u8(url: str, path: str, status_msg):
-    """Fallback for m3u8 that yt-dlp can't handle (403 errors)."""
-    headers = "\r\n".join([f"{k}: {v}" for k, v in BROWSER_HEADERS.items()])
+    """ffmpeg fallback with proper CRLF headers."""
+    header_lines = [f"{k}: {v}" for k, v in BROWSER_HEADERS.items()]
+    headers_str = "\r\n".join(header_lines) + "\r\n"
     
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-headers", headers,
+        "ffmpeg", "-y",
+        "-headers", headers_str,
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
@@ -136,17 +135,105 @@ async def download_ffmpeg_m3u8(url: str, path: str, status_msg):
         stderr=asyncio.subprocess.PIPE
     )
     
-    await status_msg.edit("Downloading via ffmpeg... (this may take a while)")
+    await status_msg.edit("Downloading via ffmpeg...")
     stdout, stderr = await proc.communicate()
     
     if proc.returncode != 0:
-        err = stderr.decode()[-500:] if stderr else "Unknown ffmpeg error"
+        err = stderr.decode()[-800:] if stderr else "Unknown error"
         raise Exception(f"ffmpeg failed: {err}")
     
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         raise Exception("ffmpeg produced no output")
     
     return path
+
+async def download_m3u8_manual(url: str, path: str, status_msg):
+    """Manually download m3u8 playlist + segments, then concat with ffmpeg."""
+    tmpdir = tempfile.mkdtemp()
+    
+    try:
+        # Step 1: Download m3u8 playlist
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"m3u8 playlist HTTP {resp.status}")
+                m3u8_text = await resp.text()
+        
+        # Step 2: Parse segments
+        base_url = url.rsplit("/", 1)[0] + "/"
+        segments = []
+        for line in m3u8_text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("http"):
+                segments.append(line)
+            else:
+                # Relative path
+                segments.append(base_url + line)
+        
+        if not segments:
+            raise Exception("No video segments found in m3u8")
+        
+        logger.info(f"Found {len(segments)} segments")
+        
+        # Step 3: Download all segments
+        seg_dir = os.path.join(tmpdir, "segs")
+        os.makedirs(seg_dir, exist_ok=True)
+        seg_files = []
+        
+        async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
+            for i, seg_url in enumerate(segments):
+                seg_path = os.path.join(seg_dir, f"{i:05d}.ts")
+                async with session.get(seg_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"Segment {i+1}/{len(segments)} failed: HTTP {resp.status}")
+                    async with aiofiles.open(seg_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                            await f.write(chunk)
+                
+                seg_files.append(seg_path)
+                
+                if i % 5 == 0 or i == len(segments) - 1:
+                    try:
+                        await status_msg.edit(f"Downloading segments... {i+1}/{len(segments)}")
+                    except:
+                        pass
+        
+        # Step 4: Concat with ffmpeg
+        concat_file = os.path.join(tmpdir, "concat.txt")
+        async with aiofiles.open(concat_file, "w") as f:
+            for seg in seg_files:
+                await f.write(f"file '{seg}'\n")
+        
+        await status_msg.edit("Merging segments...")
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c", "copy",
+            "-bsf:a", "aac_adtstoasc",
+            path
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        
+        if proc.returncode != 0:
+            err = stderr.decode()[-500:] if stderr else "concat failed"
+            raise Exception(f"ffmpeg merge failed: {err}")
+        
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            raise Exception("Merge produced no output")
+        
+        return path
+        
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ─── Handlers ───
 @client.on(events.NewMessage(pattern="/start"))
@@ -156,7 +243,7 @@ async def start(event):
         "Send me any video link and I'll download & upload it here.\n\n"
         "Direct MP4 / Signed URLs\n"
         "m3u8 / HLS / Bunny.net\n"
-        "YouTube (may need cookies.txt)\n\n"
+        "YouTube (needs cookies.txt)\n\n"
         f"Max file size: {MAX_SIZE_GB} GB",
         parse_mode="markdown"
     )
@@ -181,15 +268,25 @@ async def handle_message(event):
             filepath = base_path + ".mp4"
             await download_direct(url, filepath, status)
         elif is_m3u8:
-            # Try yt-dlp first, fallback to ffmpeg with browser headers
-            try:
-                filepath = await download_ytdlp(url, base_path + ".%(ext)s")
-            except Exception as e:
-                logger.warning(f"yt-dlp failed for m3u8: {e}, trying ffmpeg...")
-                filepath = base_path + ".mp4"
-                await download_ffmpeg_m3u8(url, filepath, status)
+            # Try 3 methods: yt-dlp -> ffmpeg -> manual
+            last_error = None
+            for method_name, method in [
+                ("yt-dlp", lambda: download_ytdlp(url, base_path + ".%(ext)s")),
+                ("ffmpeg", lambda: download_ffmpeg_m3u8(url, base_path + ".mp4", status)),
+                ("manual segments", lambda: download_m3u8_manual(url, base_path + ".mp4", status)),
+            ]:
+                try:
+                    filepath = await method()
+                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                        break
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning(f"{method_name} failed: {e}")
+                    continue
+            else:
+                raise Exception(f"All download methods failed. Last error: {last_error}")
         else:
-            # YouTube and others
+            # YouTube, etc.
             filepath = await download_ytdlp(url, base_path + ".%(ext)s")
         
         if not os.path.exists(filepath):
@@ -230,22 +327,17 @@ async def handle_message(event):
         if "Sign in to confirm" in err_str:
             await status.edit(
                 "Error: YouTube is blocking downloads.\n\n"
-                "To fix this, you need to add a cookies.txt file:\n"
-                "1. Install 'Get cookies.txt LOCALLY' extension in Chrome\n"
-                "2. Go to youtube.com and sign in\n"
-                "3. Export cookies as cookies.txt\n"
-                "4. Add it to your GitHub repo root\n"
-                "5. Redeploy",
+                "Fix: Add cookies.txt to your repo (export from Chrome while signed into YouTube).",
                 parse_mode="markdown"
             )
-        elif "HTTP Error 403" in err_str:
+        elif "HTTP Error 403" in err_str or "403 Forbidden" in err_str:
             await status.edit(
-                "Error: The video host is blocking the download (403 Forbidden).\n\n"
-                "This usually means:\n"
-                "- The link expired\n"
-                "- The link needs a Referer header from the original website\n"
-                "- The host requires login/cookies\n\n"
-                "Try getting a fresh link from the source website.",
+                "Error: 403 Forbidden — the video host is blocking this server.\n\n"
+                "Possible reasons:\n"
+                "1. The link expired (get a fresh one)\n"
+                "2. The link needs a Referer from the original website\n"
+                "3. The CDN blocks datacenter IPs (Railway)\n\n"
+                "Try: Get a fresh link from the source website and send it immediately.",
                 parse_mode="markdown"
             )
         else:
