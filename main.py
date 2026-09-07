@@ -3,7 +3,6 @@ import asyncio
 import tempfile
 import shutil
 import logging
-import re
 from telethon import TelegramClient, events
 from telethon.tl.types import DocumentAttributeVideo
 import yt_dlp
@@ -115,19 +114,40 @@ async def download_ytdlp(url: str, outtmpl: str):
     
     return await loop.run_in_executor(None, _download)
 
-async def download_ffmpeg_m3u8(url: str, path: str, status_msg):
-    """ffmpeg fallback with proper CRLF headers."""
+async def inspect_m3u8(url: str):
+    """Fetch m3u8 to check segment type and encryption."""
+    async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return None
+            text = await resp.text()
+    
+    has_dts = ".dts" in text
+    has_crypto = "#EXT-X-KEY" in text
+    return {"has_dts": has_dts, "has_crypto": has_crypto, "text": text}
+
+async def download_ffmpeg_m3u8(url: str, path: str, status_msg, has_dts=False):
+    """ffmpeg with proper flags for BunnyCDN .dts + encryption."""
     header_lines = [f"{k}: {v}" for k, v in BROWSER_HEADERS.items()]
     headers_str = "\r\n".join(header_lines) + "\r\n"
     
     cmd = [
         "ffmpeg", "-y",
         "-headers", headers_str,
+    ]
+    
+    # Critical for .dts segments
+    if has_dts:
+        cmd.extend(["-extension_picky", "0", "-allowed_extensions", "ALL"])
+    
+    cmd.extend([
         "-i", url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         path
-    ]
+    ])
+    
+    logger.info(f"ffmpeg cmd: {' '.join(cmd)}")
     
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -148,7 +168,7 @@ async def download_ffmpeg_m3u8(url: str, path: str, status_msg):
     return path
 
 async def download_m3u8_manual(url: str, path: str, status_msg):
-    """Manually download m3u8 playlist + segments, then concat with ffmpeg."""
+    """Manual segment download + merge."""
     tmpdir = tempfile.mkdtemp()
     
     try:
@@ -159,7 +179,7 @@ async def download_m3u8_manual(url: str, path: str, status_msg):
                     raise Exception(f"m3u8 playlist HTTP {resp.status}")
                 m3u8_text = await resp.text()
         
-        # Step 2: Parse segments
+        # Step 2: Parse base URL and segments
         base_url = url.rsplit("/", 1)[0] + "/"
         segments = []
         for line in m3u8_text.splitlines():
@@ -169,7 +189,6 @@ async def download_m3u8_manual(url: str, path: str, status_msg):
             if line.startswith("http"):
                 segments.append(line)
             else:
-                # Relative path
                 segments.append(base_url + line)
         
         if not segments:
@@ -184,7 +203,7 @@ async def download_m3u8_manual(url: str, path: str, status_msg):
         
         async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
             for i, seg_url in enumerate(segments):
-                seg_path = os.path.join(seg_dir, f"{i:05d}.ts")
+                seg_path = os.path.join(seg_dir, f"{i:05d}.seg")
                 async with session.get(seg_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                     if resp.status != 200:
                         raise Exception(f"Segment {i+1}/{len(segments)} failed: HTTP {resp.status}")
@@ -242,7 +261,7 @@ async def start(event):
         "Video Downloader Bot\n\n"
         "Send me any video link and I'll download & upload it here.\n\n"
         "Direct MP4 / Signed URLs\n"
-        "m3u8 / HLS / Bunny.net\n"
+        "m3u8 / HLS / Bunny.net (.dts + encrypted)\n"
         "YouTube (needs cookies.txt)\n\n"
         f"Max file size: {MAX_SIZE_GB} GB",
         parse_mode="markdown"
@@ -268,16 +287,23 @@ async def handle_message(event):
             filepath = base_path + ".mp4"
             await download_direct(url, filepath, status)
         elif is_m3u8:
-            # Try 3 methods: yt-dlp -> ffmpeg -> manual
+            # Inspect m3u8 first
+            info = await inspect_m3u8(url)
+            has_dts = info["has_dts"] if info else False
+            
+            # Try 3 methods
             last_error = None
-            for method_name, method in [
+            methods = [
                 ("yt-dlp", lambda: download_ytdlp(url, base_path + ".%(ext)s")),
-                ("ffmpeg", lambda: download_ffmpeg_m3u8(url, base_path + ".mp4", status)),
+                ("ffmpeg", lambda: download_ffmpeg_m3u8(url, base_path + ".mp4", status, has_dts)),
                 ("manual segments", lambda: download_m3u8_manual(url, base_path + ".mp4", status)),
-            ]:
+            ]
+            
+            for method_name, method in methods:
                 try:
                     filepath = await method()
                     if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                        logger.info(f"Success with {method_name}")
                         break
                 except Exception as e:
                     last_error = str(e)
@@ -330,14 +356,14 @@ async def handle_message(event):
                 "Fix: Add cookies.txt to your repo (export from Chrome while signed into YouTube).",
                 parse_mode="markdown"
             )
-        elif "HTTP Error 403" in err_str or "403 Forbidden" in err_str:
+        elif "HTTP Error 403" in err_str or "403 Forbidden" in err_str or "Server returned 403" in err_str:
             await status.edit(
-                "Error: 403 Forbidden — the video host is blocking this server.\n\n"
-                "Possible reasons:\n"
+                "Error: 403 Forbidden — the CDN is blocking this server.\n\n"
+                "This happens because:\n"
                 "1. The link expired (get a fresh one)\n"
-                "2. The link needs a Referer from the original website\n"
-                "3. The CDN blocks datacenter IPs (Railway)\n\n"
-                "Try: Get a fresh link from the source website and send it immediately.",
+                "2. BunnyCDN blocks datacenter IPs (Railway)\n"
+                "3. The link needs a Referer from the original website\n\n"
+                "Try a fresh link, or use a non-datacenter VPS.",
                 parse_mode="markdown"
             )
         else:
